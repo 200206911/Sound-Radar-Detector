@@ -18,18 +18,61 @@
 Servo myServo;
 int32_t i2s_buffer[BUFFER_SAMPLES*2]; // stereo buffer: L + R
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-#define MIC_DISTANCE 0.14
+#define MIC_DISTANCE 0.145
+#define SoS 343
 #define tmax (MIC_DISTANCE / SoS)
 #define pi 3.141592653589
-#define SoS 343
-#define LSoundThreshold 10
-#define RSoundThreshold 10
+#define LSoundThreshold 50
+#define RSoundThreshold 50
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+const char* ssid = "TNT";
+const char* password = "12345678";
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
 
+const char* html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<title>ESP32 Live Data</title>
+<style>
+  body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }
+  .value { font-size: 24px; margin: 10px 0; }
+</style>
+<script>
+let socket;
+
+function init() {
+  socket = new WebSocket("ws://" + window.location.hostname + "/ws");
+  
+  socket.onopen = function() {
+    console.log("WebSocket connected");
+  };
+
+  socket.onmessage = function(event) {
+    const values = event.data.split(",");  // expects "maxL,maxR,angle"
+    document.getElementById('a').innerText = "Left Mic: " + values[0];
+    document.getElementById('b').innerText = "Right Mic: " + values[1];
+    document.getElementById('c').innerText = "Angle: " + values[2];
+  };
+
+  socket.onclose = function() {
+    console.log("WebSocket disconnected. Refresh the page to reconnect.");
+  };
+}
+</script>
+</head>
+<body onload="init()">
+<h1>ESP32 Live Data</h1>
+<div id="a" class="value">Left Mic: 0</div>
+<div id="b" class="value">Right Mic: 0</div>
+<div id="c" class="value">Angle: 0</div>
+</body>
+</html>
+)rawliteral";
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 float currentAngle = 0;       // current approximate angle
-const float maxSpeedDegPerSec = 700.0; // measured full-speed rotation
-const float slowSpeedDegPerSec = 120.0; // slower speed for small moves
+int n=0;
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 int buttonState;
 int lastButtonState = LOW;
@@ -39,6 +82,7 @@ const unsigned long debounceDelay = 50;
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 double maxL, maxR;
 int Li, Ri;
+double angle;
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 double tri(int a, int b) {
   double t = (b - a) / (double)SAMPLE_RATE;
@@ -61,65 +105,33 @@ bool buttonPressed() {
   return pressed;
 }
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-void rotateToAngle(float targetAngle) {
-  targetAngle = fmod(targetAngle, 360.0); // wrap around 360
-  float delta = targetAngle - currentAngle;
 
-  // Shortest rotation direction
-  if (delta > 180) delta -= 360;
-  if (delta < -180) delta += 360;
-
-  int pwm;
-  float speedDegPerSec;
-
-  if (delta > 0) {
-    // Forward
-    if (delta < 60) { // small move → slow
-      pwm = pwmForwardSlow;
-      speedDegPerSec = slowSpeedDegPerSec;
-    } else {          // big move → fast
-      pwm = pwmForwardFast;
-      speedDegPerSec = maxSpeedDegPerSec;
-    }
-  } else if (delta < 0) {
-    // Backward
-    delta = -delta; // make delta positive for timing
-    if (delta < 60) { // small move → slow
-      pwm = pwmBackwardSlow;
-      speedDegPerSec = slowSpeedDegPerSec;
-    } else {          // big move → fast
-      pwm = pwmBackwardFast;
-      speedDegPerSec = maxSpeedDegPerSec;
-    }
-  } else {
-    return; // already at target
-  }
-
-  // Start rotation
-  myServo.write(pwm);
-
-  // Calculate approximate time to rotate
-  unsigned long rotationTime = (unsigned long)((delta / speedDegPerSec) * 1000);
-  delay(rotationTime);
-
-  // Stop servo
-  myServo.write(pwmStop);
-
-  // Update current angle
-  currentAngle = targetAngle;
-  Serial.print("Current Angle: ");
-  Serial.println(currentAngle);
-}
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 void setup() {
-  pinMode(BUTTON_PIN, INPUT_PULLDOWN);
-  pinMode(Led, OUTPUT);
+  Serial.begin(115200);
+  WiFi.begin(ssid, password);
+  while(WiFi.status() != WL_CONNECTED && n < 20){
+    delay(500);
+    Serial.print(".");
+    n++;
+  }
+  Serial.println(WiFi.localIP());
+  // Serve webpage
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/html", html);
+  });
+  // Start WebSocket
+  server.addHandler(&ws);
+  server.begin();
+
   myServo.setPeriodHertz(50);
   myServo.attach(servoPin, 500, 2400);
   Serial.begin(115200);
   delay(500);
   Serial.println(">>> Stereo INMP441 Test <<<");
   pinMode(TriggerOutPin, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLDOWN);
+  pinMode(Led, OUTPUT);
   // I2S configuration
   i2s_config_t cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -148,26 +160,29 @@ void setup() {
 }
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 void loop() {
-  digitalWrite(TriggerOutPin, HIGH);
+  static unsigned long lastSend = 0;
  switch (state){
   case 1:
    digitalWrite(Led, LOW);
     delay(400);
   if(buttonPressed()){
-    myServo.write(90);
-    delay(1000);
+    digitalWrite(TriggerOutPin, HIGH);
     myServo.write(0);
-    delay(1000);
+    delay(2000);
     state = 2;
   }
    break;
   case 2:
-  myServo.write(0);
-  delay(1000);
+      if(buttonPressed()){
+           digitalWrite(TriggerOutPin, LOW);
+    state = 1;
+    break;}
+ // myServo.write(0);
  digitalWrite(Led, HIGH);
   size_t bytes_read = 0;
   maxL = maxR = 0;
   Li = Ri = 0;
+  angle = 0;
   // Non-blocking read (50ms timeout)
   esp_err_t res = i2s_read(I2S_PORT, i2s_buffer, sizeof(i2s_buffer), &bytes_read, 50);
   if(res != ESP_OK) {
@@ -192,20 +207,26 @@ void loop() {
     if (abs(L) > maxL && abs(L) > LSoundThreshold) { maxL = abs(L); Li = i; }
     if (abs(R) > maxR && abs(R) > RSoundThreshold) { maxR = abs(R); Ri = i; }
   }
-    double angle = tri(Li, Ri);
+  if((int)maxL == 0 || (int)maxR == 0){
+  break;}
+  if((int)maxL != 0 || (int)maxR != 0){
+       angle = tri(Li, Ri);
+  }
    if((int)angle != 90 && (int)angle != -90 && (int)angle != 0){
   Serial.print("L peak: "); Serial.print(maxL);
+    Serial.print("L index: "); Serial.print(Li);
   Serial.print("  R peak: "); Serial.print(maxR);
-  Serial.print("  Angle: "); Serial.println(90-angle);
- myServo.write(90 - angle);
-  digitalWrite(TriggerOutPin, HIGH);
- delay(600);}
- myServo.write(0);
+  Serial.print("R index: "); Serial.print(Ri);
 
-    if(buttonPressed()){
-    state = 1;
-    break;
-                      }
+  Serial.print("  Angle: "); Serial.println(90-angle);
+ myServo.write(90 + angle);
+  // digitalWrite(TriggerOutPin, HIGH);
+  angle = 90  + angle;
+ String msg = String(maxL) + "," + String(maxR) + "," + String(angle);
+  ws.textAll(msg);
+ delay(3000);}
+
+
  }
 
    

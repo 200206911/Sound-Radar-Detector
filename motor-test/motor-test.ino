@@ -1,8 +1,8 @@
-#include <Servo.h>
+#include <ESP32Servo.h>
 
 Servo myServo;
 
-const int servoPin = 9;
+const int servoPin = 6;
 
 // Servo PWM values
 const int pwmStop = 90;
